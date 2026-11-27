@@ -406,4 +406,374 @@ assert t.count(old_block) == 1, f"{WIN}: expected 1 match for resolution block, 
 t = t.replace(old_block, new_block)
 p.write_text(t, encoding="utf-8", newline="")
 
-print("resolution patch v2 applied")
+# ---------------------------------------------------------------------------
+# 4. src/virtual_display_manager.rs — Amyuni 虚拟显示器动态分辨率回退
+#    当物理/基础显示驱动（如 Microsoft Basic Display Driver）拒绝切换分辨率
+#    （DISP_CHANGE_BADMODE）时，自动安装/挂载 WHQL 签名的 Amyuni 虚拟显示器，
+#    将目标分辨率写入 WUDF\Services\usbmmIdd\Parameters\Monitors 注册表，
+#    应用目标分辨率并设为主屏；若原屏为 Microsoft Basic Display Driver 则将其分离。
+# ---------------------------------------------------------------------------
+VDM = Path("src/virtual_display_manager.rs")
+t = VDM.read_text(encoding="utf-8")
+
+old_vdm_amyuni = '''    #[inline]
+    pub fn is_my_display(name: &str) -> bool {
+        windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING))
+            .iter()
+            .any(|s| windows::is_device_name(s, name))
+    }
+}'''
+
+new_vdm_amyuni = '''    #[inline]
+    pub fn is_my_display(name: &str) -> bool {
+        windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING))
+            .iter()
+            .any(|s| windows::is_device_name(s, name))
+    }
+
+    lazy_static::lazy_static! {
+        static ref RES_FALLBACK_LOCK: Mutex<()> = Mutex::new(());
+    }
+
+    const MONITORS_REG_PATH: &str =
+        r#"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\WUDF\\Services\\usbmmIdd\\Parameters\\Monitors"#;
+
+    const DEFAULT_MONITOR_POOL: [(usize, usize); 10] = [
+        (2560, 1600),
+        (1920, 1200),
+        (1920, 1080),
+        (1680, 1050),
+        (1600, 1200),
+        (1440, 900),
+        (1280, 1024),
+        (1280, 800),
+        (1280, 720),
+        (1024, 768),
+    ];
+
+    fn write_monitors_reg(width: usize, height: usize) -> ResultType<()> {
+        let hklm = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+        let (key, _) = hklm.create_subkey(MONITORS_REG_PATH)?;
+        let target = format!("{},{}", width, height);
+        key.set_value("", &target)?;
+        key.set_value("0", &target)?;
+        let mut slot = 1usize;
+        for &(pw, ph) in DEFAULT_MONITOR_POOL.iter() {
+            if pw == width && ph == height {
+                continue;
+            }
+            if slot > 9 {
+                break;
+            }
+            key.set_value(&slot.to_string(), &format!("{},{}", pw, ph))?;
+            slot += 1;
+        }
+        Ok(())
+    }
+
+    fn plug_in_monitor_raw(wait_timeout: Option<Duration>) -> ResultType<()> {
+        let timeout = Duration::from_secs(4);
+        let now = Instant::now();
+        loop {
+            match plug_monitor_(true, wait_timeout) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    if now.elapsed() < timeout {
+                        std::thread::sleep(Duration::from_millis(150));
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+
+    fn wait_amyuni_device(timeout: Duration) -> Option<String> {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let devs = windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING));
+            if let Some(d) = devs.into_iter().next() {
+                return Some(d.trim_end_matches('\\0').to_string());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    pub fn ensure_resolution_via_virtual_display(
+        orig_name: &str,
+        width: usize,
+        height: usize,
+    ) -> ResultType<String> {
+        let _guard = RES_FALLBACK_LOCK.lock().unwrap();
+
+        let mut is_async = false;
+        if let Err(e) = check_install_driver(&mut is_async) {
+            bail!("Failed to install Amyuni virtual display driver: {}", e);
+        }
+        if is_async {
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+
+        if let Err(e) = write_monitors_reg(width, height) {
+            log::warn!(
+                "Failed to write usbmmIdd Monitors registry for {}x{}: {:?}",
+                width,
+                height,
+                e
+            );
+        }
+
+        let orig_is_basic = windows::get_device_string(orig_name)
+            .map(|s| s.to_ascii_lowercase().contains("microsoft basic display"))
+            .unwrap_or(false);
+
+        let existing = windows::get_device_names(Some(super::AMYUNI_IDD_DEVICE_STRING));
+        let mut vdev_opt: Option<String> = None;
+
+        if let Some(first) = existing.into_iter().next() {
+            let clean = first.trim_end_matches('\\0').to_string();
+            if crate::platform::change_resolution(&clean, width, height).is_ok() {
+                vdev_opt = Some(clean);
+            } else {
+                // 目标分辨率不在当前已挂载虚拟显示器的 10 槽列表内：热拔插一次以重载注册表
+                let _ = plug_monitor_(false, Some(Duration::from_millis(1500)));
+                std::thread::sleep(Duration::from_millis(300));
+                plug_in_monitor_raw(Some(Duration::from_millis(3_000)))?;
+                vdev_opt = wait_amyuni_device(Duration::from_millis(3_500));
+            }
+        } else {
+            plug_in_monitor_raw(Some(Duration::from_millis(3_000)))?;
+            vdev_opt = wait_amyuni_device(Duration::from_millis(3_500));
+        }
+
+        let Some(vdev) = vdev_opt else {
+            bail!("Amyuni virtual display device did not appear after plug-in");
+        };
+
+        // 等待 WDDM 完成模式初始化并显式应用目标分辨率
+        let mut applied = false;
+        for _ in 0..8 {
+            if crate::platform::change_resolution(&vdev, width, height).is_ok() {
+                applied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        if !applied {
+            log::warn!(
+                "Explicit change_resolution on virtual display '{}' to {}x{} did not return Ok; continuing with topology promote",
+                &vdev,
+                width,
+                height
+            );
+        }
+
+        // 若原屏为 Microsoft Basic Display Driver 且与虚拟屏不同，则将虚拟屏设为主屏并分离原基础驱动屏
+        let orig_clean = orig_name.trim_end_matches('\\0');
+        if orig_is_basic && !orig_clean.eq_ignore_ascii_case(&vdev) {
+            windows::promote_display_and_maybe_detach(&vdev, Some(orig_clean), width as u32, height as u32);
+        } else if !orig_clean.eq_ignore_ascii_case(&vdev) {
+            windows::promote_display_and_maybe_detach(&vdev, None, width as u32, height as u32);
+        }
+
+        Ok(vdev)
+    }
+}'''
+
+assert t.count(old_vdm_amyuni) == 1, f"{VDM}: expected 1 match for is_my_display end, got {t.count(old_vdm_amyuni)}"
+t = t.replace(old_vdm_amyuni, new_vdm_amyuni)
+
+old_vdm_win_end = '''        display_drivers
+    }
+}'''
+
+new_vdm_win_end = '''        display_drivers
+    }
+
+    pub(super) fn get_device_string(name: &str) -> Option<String> {
+        let mut dd: DISPLAY_DEVICEW = unsafe { std::mem::zeroed() };
+        dd.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as DWORD;
+        let mut i_dev_num = 0;
+        loop {
+            let result = unsafe { EnumDisplayDevicesW(null_mut(), i_dev_num, &mut dd, 0) };
+            if result == 0 {
+                break;
+            }
+            i_dev_num += 1;
+            if let (Ok(device_name), Ok(ds)) = (
+                String::from_utf16(&dd.DeviceName),
+                String::from_utf16(&dd.DeviceString),
+            ) {
+                let dn_clean = device_name.trim_end_matches('\\0');
+                let target_clean = name.trim_end_matches('\\0');
+                if dn_clean.eq_ignore_ascii_case(target_clean) {
+                    return Some(ds.trim_end_matches('\\0').to_string());
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn promote_display_and_maybe_detach(
+        primary_name: &str,
+        detach_name: Option<&str>,
+        width: u32,
+        height: u32,
+    ) {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::winuser::ChangeDisplaySettingsExW;
+
+        const CDS_UPDATEREGISTRY_FLAG: DWORD = 0x00000001;
+        const CDS_SET_PRIMARY_FLAG: DWORD = 0x00000010;
+        const CDS_RESET_FLAG: DWORD = 0x40000000;
+        const CDS_NORESET_FLAG: DWORD = 0x10000000;
+        const DM_POSITION_FLAG: DWORD = 0x00000020;
+        const DM_PELSWIDTH_FLAG: DWORD = 0x00080000;
+        const DM_PELSHEIGHT_FLAG: DWORD = 0x00100000;
+        const DISP_CHANGE_OK: i32 = 0;
+
+        let primary_w: Vec<u16> = OsStr::new(primary_name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        unsafe {
+            let mut dm_primary: DEVMODEW = std::mem::zeroed();
+            dm_primary.dmSize = std::mem::size_of::<DEVMODEW>() as _;
+            dm_primary.dmFields = DM_POSITION_FLAG | DM_PELSWIDTH_FLAG | DM_PELSHEIGHT_FLAG;
+            dm_primary.dmPelsWidth = width;
+            dm_primary.dmPelsHeight = height;
+
+            if let Some(detach) = detach_name {
+                let detach_w: Vec<u16> = OsStr::new(detach)
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let mut dm_detach: DEVMODEW = std::mem::zeroed();
+                dm_detach.dmSize = std::mem::size_of::<DEVMODEW>() as _;
+                dm_detach.dmFields = DM_POSITION_FLAG | DM_PELSWIDTH_FLAG | DM_PELSHEIGHT_FLAG;
+                // dmPelsWidth = 0, dmPelsHeight = 0 => detach from desktop
+
+                let r1 = ChangeDisplaySettingsExW(
+                    primary_w.as_ptr(),
+                    &mut dm_primary,
+                    null_mut(),
+                    CDS_SET_PRIMARY_FLAG | CDS_UPDATEREGISTRY_FLAG | CDS_NORESET_FLAG,
+                    null_mut(),
+                );
+                let r2 = ChangeDisplaySettingsExW(
+                    detach_w.as_ptr(),
+                    &mut dm_detach,
+                    null_mut(),
+                    CDS_UPDATEREGISTRY_FLAG | CDS_NORESET_FLAG,
+                    null_mut(),
+                );
+                let r3 = ChangeDisplaySettingsExW(
+                    std::ptr::null(),
+                    null_mut(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                );
+                if r1 == DISP_CHANGE_OK && r2 == DISP_CHANGE_OK && r3 == DISP_CHANGE_OK {
+                    return;
+                }
+            }
+
+            // 兜底：至少将虚拟显示器设为主屏并应用目标宽高
+            let _ = ChangeDisplaySettingsExW(
+                primary_w.as_ptr(),
+                &mut dm_primary,
+                null_mut(),
+                CDS_SET_PRIMARY_FLAG | CDS_UPDATEREGISTRY_FLAG | CDS_RESET_FLAG,
+                null_mut(),
+            );
+        }
+    }
+}'''
+
+assert t.count(old_vdm_win_end) == 1, f"{VDM}: expected 1 match for windows mod end, got {t.count(old_vdm_win_end)}"
+t = t.replace(old_vdm_win_end, new_vdm_win_end)
+VDM.write_text(t, encoding="utf-8", newline="")
+
+# ---------------------------------------------------------------------------
+# 5. src/server/connection.rs — 分辨率切换失败时自动触发 Amyuni 虚拟显示器回退
+# ---------------------------------------------------------------------------
+CONN = Path("src/server/connection.rs")
+t = CONN.read_text(encoding="utf-8")
+
+old_conn_cr = '''                    if let Err(e) =
+                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
+                    {
+                        log::error!(
+                            "Failed to change resolution '{}' to ({},{}): {:?}",
+                            &name,
+                            r.width,
+                            r.height,
+                            e
+                        );
+                    }'''
+
+new_conn_cr = '''                    if let Err(e) =
+                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
+                    {
+                        log::error!(
+                            "Failed to change resolution '{}' to ({},{}): {:?}",
+                            &name,
+                            r.width,
+                            r.height,
+                            e
+                        );
+                        #[cfg(windows)]
+                        if virtual_display_manager::is_virtual_display_supported() {
+                            log::info!(
+                                "Fallback to Amyuni virtual display for resolution ({},{}) from '{}'",
+                                r.width,
+                                r.height,
+                                &name
+                            );
+                            match virtual_display_manager::amyuni_idd::ensure_resolution_via_virtual_display(
+                                &name,
+                                r.width as _,
+                                r.height as _,
+                            ) {
+                                Ok(vdev) => {
+                                    log::info!(
+                                        "Virtual display '{}' activated at ({},{})",
+                                        &vdev,
+                                        r.width,
+                                        r.height
+                                    );
+                                    let _ = display_service::check_displays_changed();
+                                    if let Ok(new_displays) = display_service::try_get_displays() {
+                                        if let Some(new_idx) = new_displays.iter().position(|disp| {
+                                            disp.name()
+                                                .trim_end_matches('\\0')
+                                                .eq_ignore_ascii_case(vdev.trim_end_matches('\\0'))
+                                        }) {
+                                            if let Some(server) = self.server.upgrade() {
+                                                let _ = self.switch_display_to(new_idx, server);
+                                            }
+                                        }
+                                    }
+                                    self.refresh_video_display(None);
+                                }
+                                Err(ve) => {
+                                    log::error!(
+                                        "Fallback to Amyuni virtual display failed for ({},{}): {:?}",
+                                        r.width,
+                                        r.height,
+                                        ve
+                                    );
+                                }
+                            }
+                        }
+                    }'''
+
+assert t.count(old_conn_cr) == 1, f"{CONN}: expected 1 match for change_resolution Err block, got {t.count(old_conn_cr)}"
+t = t.replace(old_conn_cr, new_conn_cr)
+CONN.write_text(t, encoding="utf-8", newline="")
+
+print("resolution patch v3 applied")

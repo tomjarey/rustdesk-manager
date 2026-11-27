@@ -22,7 +22,7 @@ env:
   FLUTTER_VERSION: '3.24.5'
   VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
   PATCH_MANAGER_SHA: cc982254d31475aaf0d7fa04bf4acfcd556cd24464911368581ae85cd983b78f
-  PATCH_RESOLUTION_SHA: 4f04cfd0dc4a723cd4a0360e143f6ed72a788ac0c422c63d13dba943c127856e
+  PATCH_RESOLUTION_SHA: 61821b387d23a022a12fa4238466c9305de7c8c1bc2684c26e7b1973d3de8702
 
 jobs:
   bridge:
@@ -168,6 +168,8 @@ jobs:
           grep -q '_kPresetResolutions' flutter/lib/desktop/widgets/remote_toolbar.dart
           grep -q 'fn resolve_device_name' src/platform/windows.rs
           grep -q 'fn find_best_devmode' src/platform/windows.rs
+          grep -q 'fn ensure_resolution_via_virtual_display' src/virtual_display_manager.rs
+          grep -q 'ensure_resolution_via_virtual_display' src/server/connection.rs
           git diff --check
           git diff -- flutter/lib/desktop/widgets/remote_toolbar.dart src/platform/windows.rs src/server/video_service.rs
 
