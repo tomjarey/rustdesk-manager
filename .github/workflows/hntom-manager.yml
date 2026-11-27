@@ -21,7 +21,7 @@ env:
   VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
   FLUTTER_VERSION: '3.24.5'
   VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
-  PATCH_MANAGER_SHA: 458875b5ffadab9ac915f5735cfa7b329b5cf93dc8e7199bca41212d2a8c6bfe
+  PATCH_MANAGER_SHA: cc982254d31475aaf0d7fa04bf4acfcd556cd24464911368581ae85cd983b78f
   PATCH_RESOLUTION_SHA: bc3e293e086717cd303d11671d2ad43fa2f5a09f31570f9adfbcfe43e1c3f0e6
 
 jobs:
@@ -149,6 +149,9 @@ jobs:
           grep -q '"hide-network-settings".into(), "Y".into()' libs/hbb_common/src/config.rs
           grep -q 'self.get_string(key, "best", vec!\["best", "low", "custom"\])' libs/hbb_common/src/config.rs
           grep -q 'self.get_string(key, "av1", vec!\["vp8", "vp9", "av1", "h264", "h265"\])' libs/hbb_common/src/config.rs
+          grep -qF 'let v = UserDefaultConfig::read(keys::OPTION_IMAGE_QUALITY);' libs/hbb_common/src/config.rs
+          grep -qF 'if value.is_empty() && key == keys::OPTION_CODEC_PREFERENCE {' libs/hbb_common/src/config.rs
+          grep -qF 'value = "av1".to_owned();' libs/hbb_common/src/config.rs
           grep -q 'pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();' libs/hbb_common/src/config.rs
           git -C libs/hbb_common diff --check
           git -C libs/hbb_common diff -- src/config.rs

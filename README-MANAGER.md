@@ -24,7 +24,7 @@
 ## 文件
 
 - `.github/workflows/hntom-manager.yml` — 三作业流水线（bridge / topmost / windows），产出 MSI + 单文件 EXE + 定制源码 + 补丁 + 校验文件
-- `.github/hntom/patch_manager.py` — 服务器预置、网络页隐藏、AV1 与画质最优默认值（`SHA256 458875b5ffadab9ac915f5735cfa7b329b5cf93dc8e7199bca41212d2a8c6bfe`）
+- `.github/hntom/patch_manager.py` — 服务器预置、网络页隐藏、AV1 与画质最优默认值（`SHA256 cc982254d31475aaf0d7fa04bf4acfcd556cd24464911368581ae85cd983b78f`）
 - `.github/hntom/patch_resolution.py` — 分辨率菜单强制显示 + Windows 显示器名回退（`SHA256 bc3e293e086717cd303d11671d2ad43fa2f5a09f31570f9adfbcfe43e1c3f0e6`，与被控端仓库同一份）
 - `.github/workflows-upstream/` — 上游工作流原样存档，挪出 `workflows/` 目录以免在本仓库触发上游 CI
 
