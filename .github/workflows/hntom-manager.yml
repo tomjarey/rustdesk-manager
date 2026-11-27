@@ -1,0 +1,379 @@
+name: HNTOM Manager Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/hntom-manager.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hntom-manager
+  cancel-in-progress: false
+
+env:
+  CUSTOM_VERSION: '1.5.3'
+  SOURCE_SHA: 95cca3f661f635b3cc85c04935fe8d96d8f432ef
+  HBB_COMMON_SHA: fae47e024dd83cef6aaecde0aa7d11731df11649
+  VCPKG_COMMIT_ID: 9e593bb18ea69cc5095e012465dcd675a822ed0d
+  FLUTTER_VERSION: '3.24.5'
+  VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
+  PATCH_MANAGER_SHA: 458875b5ffadab9ac915f5735cfa7b329b5cf93dc8e7199bca41212d2a8c6bfe
+  PATCH_RESOLUTION_SHA: bc3e293e086717cd303d11671d2ad43fa2f5a09f31570f9adfbcfe43e1c3f0e6
+
+jobs:
+  bridge:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: recursive
+      - name: Verify pinned source and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C libs/hbb_common rev-parse HEAD)" = "$HBB_COMMON_SHA"
+          test "$(git ls-tree HEAD libs/hbb_common | cut -f1 | cut -d' ' -f3)" = "$HBB_COMMON_SHA"
+          git submodule status --recursive | tee "$RUNNER_TEMP/hntom-submodules.txt"
+          if grep -Eq '^[+U-]' "$RUNNER_TEMP/hntom-submodules.txt"; then exit 1; fi
+          git diff --exit-code
+          git -C libs/hbb_common diff --exit-code
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path('.')
+          version = os.environ['CUSTOM_VERSION']
+          assert re.search(r'^version = "' + re.escape(version) + r'"$', (root / 'Cargo.toml').read_text(), re.M)
+          assert re.search(r'^version: ' + re.escape(version) + r'\+', (root / 'flutter/pubspec.yaml').read_text(), re.M)
+          assert os.environ['VCPKG_COMMIT_ID'] in (root / '.github/workflows/flutter-build.yml').read_text()
+          PY
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl gcc git g++ libclang-dev libgtk-3-dev llvm-dev nasm ninja-build pkg-config wget
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: '1.75'
+          components: rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          channel: stable
+          flutter-version: '3.22.3'
+          cache: true
+      - name: Generate bridge
+        run: |
+          set -euo pipefail
+          cargo install cargo-expand --version 1.0.95 --locked
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --features uuid --locked
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('flutter/pubspec.yaml')
+          text = p.read_text()
+          old = '  extended_text: 14.0.0\n'
+          assert text.count(old) == 1, 'Unexpected extended_text declaration'
+          p.write_text(text.replace(old, '  extended_text: 13.0.0\n'))
+          PY
+          (cd flutter && flutter pub get)
+          ~/.cargo/bin/flutter_rust_bridge_codegen --rust-input ./src/flutter_ffi.rs --dart-output ./flutter/lib/generated_bridge.dart --c-output ./flutter/macos/Runner/bridge_generated.h
+          cp flutter/macos/Runner/bridge_generated.h flutter/ios/Runner/bridge_generated.h
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: bridge-artifact
+          path: |
+            ./src/bridge_generated.rs
+            ./src/bridge_generated.io.rs
+            ./flutter/lib/generated_bridge.dart
+            ./flutter/lib/generated_bridge.freezed.dart
+            ./flutter/macos/Runner/bridge_generated.h
+            ./flutter/ios/Runner/bridge_generated.h
+
+  topmost:
+    # 可复用工作流引用不能使用 env 表达式，必须与 SOURCE_SHA 保持一致。
+    uses: rustdesk/rustdesk/.github/workflows/third-party-RustDeskTempTopMostWindow.yml@95cca3f661f635b3cc85c04935fe8d96d8f432ef
+    with:
+      upload-artifact: true
+      target: windows-2022
+      configuration: Release
+      platform: x64
+      target_version: Windows10
+
+  windows:
+    needs: [bridge, topmost]
+    runs-on: windows-2022
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: recursive
+
+      - name: Verify pinned source and versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C libs/hbb_common rev-parse HEAD)" = "$HBB_COMMON_SHA"
+          test "$(git ls-tree HEAD libs/hbb_common | cut -f1 | cut -d' ' -f3)" = "$HBB_COMMON_SHA"
+          git submodule status --recursive | tee "$RUNNER_TEMP/hntom-submodules.txt"
+          if grep -Eq '^[+U-]' "$RUNNER_TEMP/hntom-submodules.txt"; then exit 1; fi
+          git diff --exit-code
+          git -C libs/hbb_common diff --exit-code
+          python3 - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path('.')
+          version = os.environ['CUSTOM_VERSION']
+          assert re.search(r'^version = "' + re.escape(version) + r'"$', (root / 'Cargo.toml').read_text(), re.M)
+          assert re.search(r'^version: ' + re.escape(version) + r'\+', (root / 'flutter/pubspec.yaml').read_text(), re.M)
+          assert os.environ['VCPKG_COMMIT_ID'] in (root / '.github/workflows/flutter-build.yml').read_text()
+          PY
+
+      - name: Apply and verify manager configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/.github/hntom"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/hntom-patch-manager.py" "$base/patch_manager.py"
+          echo "$PATCH_MANAGER_SHA  $RUNNER_TEMP/hntom-patch-manager.py" | sha256sum -c -
+          python3 "$RUNNER_TEMP/hntom-patch-manager.py"
+          grep -q '"custom-rendezvous-server".into(), "hntom.cn".into()' libs/hbb_common/src/config.rs
+          grep -q '"api-server".into(), "https://hntom.cn:21114/client".into()' libs/hbb_common/src/config.rs
+          grep -q '"hide-network-settings".into(), "Y".into()' libs/hbb_common/src/config.rs
+          grep -q 'self.get_string(key, "best", vec!\["best", "low", "custom"\])' libs/hbb_common/src/config.rs
+          grep -q 'self.get_string(key, "av1", vec!\["vp8", "vp9", "av1", "h264", "h265"\])' libs/hbb_common/src/config.rs
+          grep -q 'pub static ref HARD_SETTINGS: RwLock<HashMap<String, String>> = Default::default();' libs/hbb_common/src/config.rs
+          git -C libs/hbb_common diff --check
+          git -C libs/hbb_common diff -- src/config.rs
+
+      - name: Patch resolution menu and Windows display fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/.github/hntom/patch_resolution.py"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/hntom-patch-res.py" "$url"
+          echo "$PATCH_RESOLUTION_SHA  $RUNNER_TEMP/hntom-patch-res.py" | sha256sum -c -
+          python3 "$RUNNER_TEMP/hntom-patch-res.py"
+          grep -q 'final isVirtualDisplay = ffiModel.isVirtualDisplayResolution;' flutter/lib/desktop/widgets/remote_toolbar.dart
+          grep -q 'fn resolve_device_name' src/platform/windows.rs
+          git diff --check
+          git diff -- flutter/lib/desktop/widgets/remote_toolbar.dart src/platform/windows.rs
+
+      - name: Archive corresponding customized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p SignOutput
+          git -C libs/hbb_common diff > SignOutput/hntom-config.patch
+          git diff > SignOutput/hntom-resolution.patch
+          cp "$RUNNER_TEMP/hntom-patch-manager.py" SignOutput/hntom-manager.py
+          cp "$RUNNER_TEMP/hntom-patch-res.py" SignOutput/hntom-resolution.py
+          git submodule status --recursive > SignOutput/GIT-SUBMODULES.txt
+          printf 'Custom version: %s (manager/controller build)\nUpstream source: %s\nhbb_common: %s\nvcpkg: %s\nWorkflow: %s\nID/relay: hntom.cn\nKey: RhWHCrir6gLBCZtX8BTdoT04nn+yfAzbh5Fi2SKFtW0=\nAPI: https://hntom.cn:21114/client\nNetwork settings tab: hidden (hide-network-settings=Y)\nDefault codec: av1\nDefault image quality: best\nIncoming-only: no (full controller client)\nTLS validation unchanged. Unsigned build.\nPrinter driver not bundled; printer code and CLI remain upstream.\nResolution menu forced visible on the controlling window; Windows display device name falls back to DISPLAY1-8 when the reported name cannot be enumerated.\nArchive is the customized pre-build source; generated bridge files are restored separately.\n' "$CUSTOM_VERSION" "$SOURCE_SHA" "$HBB_COMMON_SHA" "$VCPKG_COMMIT_ID" "$GITHUB_SHA" > SignOutput/BUILD-INFO.txt
+          mkdir -p "$RUNNER_TEMP/hntom-source-provenance"
+          cp SignOutput/BUILD-INFO.txt "$RUNNER_TEMP/hntom-source-provenance/HNTOM-BUILD-INFO.txt"
+          cp SignOutput/GIT-SUBMODULES.txt "$RUNNER_TEMP/hntom-source-provenance/HNTOM-GIT-SUBMODULES.txt"
+          tar --exclude='.git' --exclude='./SignOutput' -czf "SignOutput/rustdesk-${CUSTOM_VERSION}-hntom-manager-source.tar.gz" . -C "$RUNNER_TEMP/hntom-source-provenance" HNTOM-BUILD-INFO.txt HNTOM-GIT-SUBMODULES.txt
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: '15.0.6'
+
+      - uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Prepare upstream custom Flutter engine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter precache --windows
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter precache failed' }
+          $engineUrl = 'https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip'
+          Invoke-WebRequest $engineUrl -OutFile engine.zip
+          $engineHash = (Get-FileHash engine.zip -Algorithm SHA256).Hash
+          "Engine URL: $engineUrl`nEngine archive SHA256 (observed, not a trusted pin): $engineHash" | Add-Content SignOutput/BUILD-INFO.txt -Encoding utf8
+          "$engineHash  engine.zip" | Set-Content SignOutput/EXTERNAL-ASSETS-SHA256.txt -Encoding utf8
+          $engineSource = Join-Path $env:RUNNER_TEMP 'hntom-windows-x64-release'
+          Expand-Archive engine.zip -DestinationPath $engineSource -Force
+          $flutterBin = Split-Path (Get-Command flutter).Source -Parent
+          $engineTarget = Join-Path $flutterBin 'cache/artifacts/engine/windows-x64-release'
+          if (!(Test-Path "$engineSource/flutter_windows.dll")) { throw 'Downloaded archive is missing flutter_windows.dll' }
+          if (!(Test-Path $engineTarget -PathType Container)) { throw "Flutter engine destination not found: $engineTarget" }
+          Copy-Item "$engineSource/*" $engineTarget -Recurse -Force
+          foreach ($file in (Get-ChildItem $engineSource -File -Recurse)) {
+            $relative = [IO.Path]::GetRelativePath($engineSource, $file.FullName)
+            $destination = Join-Path $engineTarget $relative
+            if (!(Test-Path $destination -PathType Leaf)) { throw "Missing copied engine file: $relative" }
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            if ($hash -ne (Get-FileHash $destination -Algorithm SHA256).Hash) { throw "Engine copy verification failed: $relative" }
+            "$hash  engine/$relative" | Add-Content SignOutput/EXTERNAL-ASSETS-SHA256.txt -Encoding utf8
+          }
+
+      - name: Patch Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff "$(dirname "$(dirname "$(which flutter)")")"
+          cd "$(dirname "$(dirname "$(which flutter)")")"
+          git apply --check flutter_3.24.4_dropdown_menu_enableFilter.diff
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: '1.75'
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          prefix-key: hntom-manager-windows-2022
+
+      - uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Verify vcpkg and record build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C "$VCPKG_ROOT" rev-parse HEAD)" = "$VCPKG_COMMIT_ID"
+          {
+            printf '\nBuild tool versions:\n'
+            rustc --version
+            cargo --version
+            flutter --version
+            python3 --version
+            cmake --version
+            git submodule status --recursive
+          } | tee -a SignOutput/BUILD-INFO.txt
+
+      - name: Install native dependencies
+        shell: bash
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        run: |
+          set -euo pipefail
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Build manager client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          if ($LASTEXITCODE -ne 0) { throw 'RustDesk build failed' }
+          Move-Item ./flutter/build/windows/x64/runner/Release ./rustdesk
+          Invoke-WebRequest https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
+          "$((Get-FileHash usbmmidd_v2.zip -Algorithm SHA256).Hash)  usbmmidd_v2.zip" | Add-Content SignOutput/EXTERNAL-ASSETS-SHA256.txt -Encoding utf8
+          Expand-Archive usbmmidd_v2.zip -DestinationPath .
+          Remove-Item usbmmidd_v2/Win32 -Recurse
+          Remove-Item usbmmidd_v2/deviceinstaller64.exe,usbmmidd_v2/deviceinstaller.exe,usbmmidd_v2/usbmmidd.bat
+          Move-Item usbmmidd_v2 ./rustdesk
+
+      - name: Copy executable resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner_res=$(find flutter/build -name Runner.res -print -quit)
+          test -n "$runner_res"
+          cp "$runner_res" ./libs/portable/Runner.res
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: topmostwindow-artifacts-x64
+          path: ./rustdesk
+
+      - name: Verify no printer driver is bundled
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $drivers = Get-ChildItem ./rustdesk -Recurse -File | Where-Object { $_.Name -match '(?i)(printer|\.ppd$|\.gpd$)' }
+          if ($drivers) { throw "Unexpected printer payload: $($drivers.FullName -join ', ')" }
+          Get-ChildItem ./rustdesk -Recurse -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $([IO.Path]::GetRelativePath((Resolve-Path ./rustdesk).Path, $_.FullName))"
+          } | Set-Content SignOutput/PAYLOAD-SHA256.txt -Encoding utf8
+
+      - name: Package portable EXE
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd libs/portable
+          pip3 install -r requirements.txt
+          python3 generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          cp target/release/rustdesk-portable-packer.exe "SignOutput/rustdesk-${CUSTOM_VERSION}-hntom-manager-windows-x64.exe"
+          cmp target/release/rustdesk-portable-packer.exe "SignOutput/rustdesk-${CUSTOM_VERSION}-hntom-manager-windows-x64.exe"
+          test -s "SignOutput/rustdesk-${CUSTOM_VERSION}-hntom-manager-windows-x64.exe"
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@6fb02220983dee41ce7ae257b6f4d8f9bf5ed4ce
+        with:
+          msbuild-architecture: x86
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pushd ./res/msi
+          python preprocess.py --arp -d ../../rustdesk
+          if ($LASTEXITCODE -ne 0) { throw 'MSI preprocess failed' }
+          nuget restore msi.sln
+          if ($LASTEXITCODE -ne 0) { throw 'nuget restore failed' }
+          msbuild msi.sln -p:Configuration=Release -p:Platform=x64 /p:TargetVersion=Windows10
+          if ($LASTEXITCODE -ne 0) { throw 'MSI build failed' }
+          $msi = Get-ChildItem ./Package/bin/*/Release/en-us/Package.msi | Select-Object -First 1
+          if (-not $msi) { throw 'Package.msi not produced' }
+          Copy-Item $msi.FullName "../../SignOutput/rustdesk-manager-$env:CUSTOM_VERSION-windows-x64.msi"
+          popd
+          if (!(Test-Path "SignOutput/rustdesk-manager-$env:CUSTOM_VERSION-windows-x64.msi")) { throw 'MSI copy failed' }
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd SignOutput
+          sha256sum *.exe *.msi *.tar.gz *.patch *.py BUILD-INFO.txt GIT-SUBMODULES.txt EXTERNAL-ASSETS-SHA256.txt PAYLOAD-SHA256.txt > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+          ls -l
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-${{ env.CUSTOM_VERSION }}-hntom-manager-windows-x64
+          path: SignOutput/*
+          if-no-files-found: error
+
+      - name: Publish customized release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
+        with:
+          repository: ${{ github.repository }}
+          target_commitish: ${{ github.sha }}
+          tag_name: hntom-manager-${{ env.CUSTOM_VERSION }}-${{ github.run_number }}
+          name: HNTOM Manager ${{ env.CUSTOM_VERSION }} Windows x64 (unsigned)
+          prerelease: true
+          body: |
+            Windows x64 manager/controller build. ID server, relay server, API server and public key are preset (hntom.cn / https://hntom.cn:21114/client / RhWHCrir6gLBCZtX8BTdoT04nn+yfAzbh5Fi2SKFtW0=) and the Network settings tab is hidden. Default codec is AV1; default image quality is Best. The resolution submenu of the remote toolbar is forced visible so resolution can be changed manually on every session. Full outgoing client (not incoming-only); TLS validation unchanged; unsigned. MSI installer and single-file portable EXE are both attached, plus the customized pre-build source and SHA256 checksums.
+          files: SignOutput/*
+          fail_on_unmatched_files: true
