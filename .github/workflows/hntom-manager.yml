@@ -22,7 +22,7 @@ env:
   FLUTTER_VERSION: '3.24.5'
   VCPKG_BINARY_SOURCES: 'clear;x-gha,readwrite'
   PATCH_MANAGER_SHA: cc982254d31475aaf0d7fa04bf4acfcd556cd24464911368581ae85cd983b78f
-  PATCH_RESOLUTION_SHA: bc3e293e086717cd303d11671d2ad43fa2f5a09f31570f9adfbcfe43e1c3f0e6
+  PATCH_RESOLUTION_SHA: 4f04cfd0dc4a723cd4a0360e143f6ed72a788ac0c422c63d13dba943c127856e
 
 jobs:
   bridge:
@@ -165,9 +165,11 @@ jobs:
           echo "$PATCH_RESOLUTION_SHA  $RUNNER_TEMP/hntom-patch-res.py" | sha256sum -c -
           python3 "$RUNNER_TEMP/hntom-patch-res.py"
           grep -q 'final isVirtualDisplay = ffiModel.isVirtualDisplayResolution;' flutter/lib/desktop/widgets/remote_toolbar.dart
+          grep -q '_kPresetResolutions' flutter/lib/desktop/widgets/remote_toolbar.dart
           grep -q 'fn resolve_device_name' src/platform/windows.rs
+          grep -q 'fn find_best_devmode' src/platform/windows.rs
           git diff --check
-          git diff -- flutter/lib/desktop/widgets/remote_toolbar.dart src/platform/windows.rs
+          git diff -- flutter/lib/desktop/widgets/remote_toolbar.dart src/platform/windows.rs src/server/video_service.rs
 
       - name: Archive corresponding customized source
         shell: bash
