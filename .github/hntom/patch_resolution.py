@@ -700,23 +700,67 @@ VDM.write_text(t, encoding="utf-8", newline="")
 
 # ---------------------------------------------------------------------------
 # 5. src/server/connection.rs — 分辨率切换失败时自动触发 Amyuni 虚拟显示器回退
+#    + 被控端按控制端 ID (self.lr.my_id) 持久化记录生效分辨率并在下次同控制端连入时自动恢复
 # ---------------------------------------------------------------------------
 CONN = Path("src/server/connection.rs")
 t = CONN.read_text(encoding="utf-8")
 
-old_conn_cr = '''                    if let Err(e) =
-                        crate::platform::change_resolution(&name, r.width as _, r.height as _)
-                    {
-                        log::error!(
-                            "Failed to change resolution '{}' to ({},{}): {:?}",
-                            &name,
-                            r.width,
-                            r.height,
-                            e
-                        );
-                    }'''
+old_conn_sub = '''        } else if sub_service {
+            if !wait_session_id_confirm {
+                self.try_sub_monitor_services();
+            }
+        }'''
 
-new_conn_cr = '''                    if let Err(e) =
+new_conn_sub = '''        } else if sub_service {
+            if !wait_session_id_confirm {
+                self.try_sub_monitor_services();
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                self.apply_saved_controller_resolution();
+            }
+        }'''
+
+assert t.count(old_conn_sub) == 1, f"{CONN}: expected 1 match for try_sub_monitor_services block, got {t.count(old_conn_sub)}"
+t = t.replace(old_conn_sub, new_conn_sub)
+
+old_conn_cr = '''    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+        if self.keyboard {
+            if let Ok(displays) = display_service::try_get_displays() {
+                let display_idx = d.unwrap_or(self.display_idx);
+                if let Some(display) = displays.get(display_idx) {
+                    let name = display.name();
+                    #[cfg(windows)]
+                    if let Some(_ok) =
+                        virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
+                            &name,
+                            r.width as _,
+                            r.height as _,
+                        )
+                    {
+                        return;
+                    }
+                    #[allow(unused_mut)]
+                    let mut record_changed = true;
+                    #[cfg(windows)]
+                    if virtual_display_manager::amyuni_idd::is_my_display(&name) {
+                        record_changed = false;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let scale = 1.0;
+                    #[cfg(target_os = "macos")]
+                    let scale = display.scale();
+                    let original = (
+                        ((display.width() as f64) / scale).round() as _,
+                        (display.height() as f64 / scale).round() as _,
+                    );
+                    if record_changed {
+                        display_service::set_last_changed_resolution(
+                            &name,
+                            original,
+                            (r.width, r.height),
+                        );
+                    }
+                    if let Err(e) =
                         crate::platform::change_resolution(&name, r.width as _, r.height as _)
                     {
                         log::error!(
@@ -726,54 +770,415 @@ new_conn_cr = '''                    if let Err(e) =
                             r.height,
                             e
                         );
-                        #[cfg(windows)]
-                        if virtual_display_manager::is_virtual_display_supported() {
-                            log::info!(
-                                "Fallback to Amyuni virtual display for resolution ({},{}) from '{}'",
+                    }
+                }
+            }
+        }
+    }'''
+
+new_conn_cr = '''    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn hntom_peer_resolutions_path() -> Option<std::path::PathBuf> {
+        hbb_common::config::Config::file()
+            .parent()
+            .map(|p| p.join("hntom_peer_resolutions.json"))
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn load_controller_resolution(peer_id: &str) -> Option<(i32, i32)> {
+        if peer_id.is_empty() {
+            return None;
+        }
+        let path = Self::hntom_peer_resolutions_path()?;
+        let data = std::fs::read_to_string(path).ok()?;
+        let map: std::collections::HashMap<String, [i32; 2]> =
+            serde_json::from_str(&data).ok()?;
+        map.get(peer_id)
+            .copied()
+            .filter(|&[w, h]| w > 0 && h > 0)
+            .map(|[w, h]| (w, h))
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn save_controller_resolution(peer_id: &str, width: i32, height: i32) {
+        lazy_static::lazy_static! {
+            static ref RES_STORE_LOCK: Mutex<()> = Mutex::new(());
+        }
+        if peer_id.is_empty() || width <= 0 || height <= 0 {
+            return;
+        }
+        let Some(path) = Self::hntom_peer_resolutions_path() else {
+            return;
+        };
+        let _guard = RES_STORE_LOCK.lock().unwrap();
+        let mut map: std::collections::HashMap<String, [i32; 2]> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if map.get(peer_id) == Some(&[width, height]) {
+            return;
+        }
+        map.insert(peer_id.to_string(), [width, height]);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&map) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &json).is_ok() {
+                if std::fs::rename(&tmp, &path).is_err() {
+                    let _ = std::fs::write(&path, &json);
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            } else {
+                let _ = std::fs::write(&path, &json);
+            }
+            log::info!(
+                "Saved controller '{}' resolution ({},{}) to {:?}",
+                peer_id,
+                width,
+                height,
+                path
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn apply_saved_controller_resolution(&mut self) {
+        if !self.is_remote() || !self.keyboard || self.lr.my_id.is_empty() {
+            return;
+        }
+        let Some((w, h)) = Self::load_controller_resolution(&self.lr.my_id) else {
+            return;
+        };
+        log::info!(
+            "Auto-applying saved resolution ({},{}) for returning controller '{}'",
+            w,
+            h,
+            &self.lr.my_id
+        );
+        self.change_resolution(
+            None,
+            &Resolution {
+                width: w,
+                height: h,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn change_resolution(&mut self, d: Option<usize>, r: &Resolution) {
+        if self.keyboard {
+            if let Ok(displays) = display_service::try_get_displays() {
+                let display_idx = d.unwrap_or(self.display_idx);
+                if let Some(display) = displays.get(display_idx) {
+                    let name = display.name();
+                    if r.width > 0
+                        && r.height > 0
+                        && display.width() as i32 == r.width
+                        && display.height() as i32 == r.height
+                    {
+                        Self::save_controller_resolution(&self.lr.my_id, r.width, r.height);
+                        return;
+                    }
+                    #[cfg(windows)]
+                    if let Some(ok) =
+                        virtual_display_manager::rustdesk_idd::change_resolution_if_is_virtual_display(
+                            &name,
+                            r.width as _,
+                            r.height as _,
+                        )
+                    {
+                        if ok {
+                            Self::save_controller_resolution(&self.lr.my_id, r.width, r.height);
+                        }
+                        return;
+                    }
+                    #[allow(unused_mut)]
+                    let mut record_changed = true;
+                    #[cfg(windows)]
+                    if virtual_display_manager::amyuni_idd::is_my_display(&name) {
+                        record_changed = false;
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    let scale = 1.0;
+                    #[cfg(target_os = "macos")]
+                    let scale = display.scale();
+                    let original = (
+                        ((display.width() as f64) / scale).round() as _,
+                        (display.height() as f64 / scale).round() as _,
+                    );
+                    if record_changed {
+                        display_service::set_last_changed_resolution(
+                            &name,
+                            original,
+                            (r.width, r.height),
+                        );
+                    }
+                    match crate::platform::change_resolution(&name, r.width as _, r.height as _) {
+                        Ok(()) => {
+                            Self::save_controller_resolution(&self.lr.my_id, r.width, r.height);
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to change resolution '{}' to ({},{}): {:?}",
+                                &name,
                                 r.width,
                                 r.height,
-                                &name
+                                e
                             );
-                            match virtual_display_manager::amyuni_idd::ensure_resolution_via_virtual_display(
-                                &name,
-                                r.width as _,
-                                r.height as _,
-                            ) {
-                                Ok(vdev) => {
-                                    log::info!(
-                                        "Virtual display '{}' activated at ({},{})",
-                                        &vdev,
-                                        r.width,
-                                        r.height
-                                    );
-                                    let _ = display_service::check_displays_changed();
-                                    if let Ok(new_displays) = display_service::try_get_displays() {
-                                        if let Some(new_idx) = new_displays.iter().position(|disp| {
-                                            disp.name()
-                                                .trim_end_matches('\\0')
-                                                .eq_ignore_ascii_case(vdev.trim_end_matches('\\0'))
-                                        }) {
-                                            if let Some(server) = self.server.upgrade() {
-                                                let _ = self.switch_display_to(new_idx, server);
+                            #[cfg(windows)]
+                            if virtual_display_manager::is_virtual_display_supported() {
+                                log::info!(
+                                    "Fallback to Amyuni virtual display for resolution ({},{}) from '{}'",
+                                    r.width,
+                                    r.height,
+                                    &name
+                                );
+                                match virtual_display_manager::amyuni_idd::ensure_resolution_via_virtual_display(
+                                    &name,
+                                    r.width as _,
+                                    r.height as _,
+                                ) {
+                                    Ok(vdev) => {
+                                        log::info!(
+                                            "Virtual display '{}' activated at ({},{})",
+                                            &vdev,
+                                            r.width,
+                                            r.height
+                                        );
+                                        Self::save_controller_resolution(
+                                            &self.lr.my_id,
+                                            r.width,
+                                            r.height,
+                                        );
+                                        let _ = display_service::check_displays_changed();
+                                        if let Ok(new_displays) = display_service::try_get_displays()
+                                        {
+                                            if let Some(new_idx) = new_displays.iter().position(|disp| {
+                                                disp.name()
+                                                    .trim_end_matches('\\0')
+                                                    .eq_ignore_ascii_case(
+                                                        vdev.trim_end_matches('\\0'),
+                                                    )
+                                            }) {
+                                                if let Some(server) = self.server.upgrade() {
+                                                    let _ = self.switch_display_to(new_idx, server);
+                                                }
                                             }
                                         }
+                                        self.refresh_video_display(None);
                                     }
-                                    self.refresh_video_display(None);
-                                }
-                                Err(ve) => {
-                                    log::error!(
-                                        "Fallback to Amyuni virtual display failed for ({},{}): {:?}",
-                                        r.width,
-                                        r.height,
-                                        ve
-                                    );
+                                    Err(ve) => {
+                                        log::error!(
+                                            "Fallback to Amyuni virtual display failed for ({},{}): {:?}",
+                                            r.width,
+                                            r.height,
+                                            ve
+                                        );
+                                    }
                                 }
                             }
                         }
-                    }'''
+                    }
+                }
+            }
+        }
+    }'''
 
-assert t.count(old_conn_cr) == 1, f"{CONN}: expected 1 match for change_resolution Err block, got {t.count(old_conn_cr)}"
+assert t.count(old_conn_cr) == 1, f"{CONN}: expected 1 match for change_resolution fn, got {t.count(old_conn_cr)}"
 t = t.replace(old_conn_cr, new_conn_cr)
 CONN.write_text(t, encoding="utf-8", newline="")
 
-print("resolution patch v3 applied")
+# ---------------------------------------------------------------------------
+# 6. src/ui_session_interface.rs — 控制端记录生效分辨率并重连自动恢复
+#    - 延长生效确认窗口至 30 秒（覆盖首次虚拟显示器挂载）
+#    - 不再因 original_resolution 相同或显示索引变化而误清 custom_resolutions
+#    - 支持通过 PeerInfo.displays 更新确认生效并落盘到 PeerConfig.custom_resolutions
+#    - 重连时优先匹配当前 display，回退 display 0；若当前分辨率已一致则跳过
+# ---------------------------------------------------------------------------
+UISI = Path("src/ui_session_interface.rs")
+t = UISI.read_text(encoding="utf-8")
+
+old_timeout = 'const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;'
+new_timeout = 'const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 30;'
+assert t.count(old_timeout) == 1, f"{UISI}: expected 1 match for CHANGE_RESOLUTION_VALID_TIMEOUT_SECS"
+t = t.replace(old_timeout, new_timeout)
+
+old_uisi_res = '''    fn set_custom_resolution(&self, display: &SwitchDisplay) {
+        if display.width == display.original_resolution.width
+            && display.height == display.original_resolution.height
+        {
+            self.lc
+                .write()
+                .unwrap()
+                .set_custom_resolution(display.display, None);
+        } else {
+            let last_change_display = self.last_change_display.lock().unwrap();
+            if last_change_display.display == display.display {
+                let wh = if last_change_display.is_the_same_record(
+                    display.display,
+                    display.width,
+                    display.height,
+                ) {
+                    Some((display.width, display.height))
+                } else {
+                    // display origin is changed, or some other events.
+                    None
+                };
+                self.lc
+                    .write()
+                    .unwrap()
+                    .set_custom_resolution(display.display, wh);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn handle_peer_switch_display(&self, display: &SwitchDisplay) {
+        self.ui_handler.switch_display(display);
+        self.set_custom_resolution(display);
+    }
+
+    #[inline]
+    pub fn change_resolution(&self, display: i32, width: i32, height: i32) {
+        *self.last_change_display.lock().unwrap() =
+            ChangeDisplayRecord::new(display, width, height);
+        self.do_change_resolution(display, width, height);
+    }
+
+    #[inline]
+    fn try_change_init_resolution(&self, display: i32) {
+        let Some((w, h)) = self.lc.read().unwrap().get_custom_resolution(display) else {
+            return;
+        };
+        self.change_resolution(display, w, h);
+    }'''
+
+new_uisi_res = '''    fn persist_confirmed_resolution(&self, display: i32, width: i32, height: i32) {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let mut lc = self.lc.write().unwrap();
+        lc.set_custom_resolution(display, Some((width, height)));
+        if display != 0 {
+            lc.set_custom_resolution(0, Some((width, height)));
+        }
+        log::info!(
+            "Persisted confirmed custom resolution ({},{}) for display {}",
+            width,
+            height,
+            display
+        );
+    }
+
+    fn set_custom_resolution(&self, display: &SwitchDisplay) {
+        let matched = {
+            let last = self.last_change_display.lock().unwrap();
+            last.time.elapsed().as_secs() < CHANGE_RESOLUTION_VALID_TIMEOUT_SECS
+                && last.width == display.width
+                && last.height == display.height
+                && display.width > 0
+                && display.height > 0
+        };
+        if matched {
+            self.persist_confirmed_resolution(display.display, display.width, display.height);
+        }
+    }
+
+    pub fn confirm_resolution_from_displays(&self, displays: &[DisplayInfo]) {
+        let (target_w, target_h, valid) = {
+            let last = self.last_change_display.lock().unwrap();
+            (
+                last.width,
+                last.height,
+                last.time.elapsed().as_secs() < CHANGE_RESOLUTION_VALID_TIMEOUT_SECS
+                    && last.width > 0
+                    && last.height > 0,
+            )
+        };
+        if !valid {
+            return;
+        }
+        if let Some((idx, _)) = displays
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.width == target_w && d.height == target_h)
+        {
+            self.persist_confirmed_resolution(idx as i32, target_w, target_h);
+        }
+    }
+
+    #[inline]
+    pub fn handle_peer_switch_display(&self, display: &SwitchDisplay) {
+        self.ui_handler.switch_display(display);
+        self.set_custom_resolution(display);
+    }
+
+    #[inline]
+    pub fn change_resolution(&self, display: i32, width: i32, height: i32) {
+        *self.last_change_display.lock().unwrap() =
+            ChangeDisplayRecord::new(display, width, height);
+        self.do_change_resolution(display, width, height);
+    }
+
+    #[inline]
+    fn try_change_init_resolution(&self, display: i32) {
+        let (saved, current_wh) = {
+            let lc = self.lc.read().unwrap();
+            let saved = lc
+                .get_custom_resolution(display)
+                .or_else(|| lc.get_custom_resolution(0));
+            let current_wh = lc
+                .peer_info
+                .as_ref()
+                .and_then(|pi| pi.displays.get(display as usize))
+                .map(|d| (d.width, d.height));
+            (saved, current_wh)
+        };
+        let Some((w, h)) = saved else {
+            return;
+        };
+        if current_wh == Some((w, h)) {
+            log::info!(
+                "Initial display {} already at saved resolution ({},{}), skip change",
+                display,
+                w,
+                h
+            );
+            return;
+        }
+        log::info!(
+            "Auto-restoring saved custom resolution ({},{}) on display {}",
+            w,
+            h,
+            display
+        );
+        self.change_resolution(display, w, h);
+    }'''
+
+assert t.count(old_uisi_res) == 1, f"{UISI}: expected 1 match for set_custom_resolution block, got {t.count(old_uisi_res)}"
+t = t.replace(old_uisi_res, new_uisi_res)
+UISI.write_text(t, encoding="utf-8", newline="")
+
+# ---------------------------------------------------------------------------
+# 7. src/client/io_loop.rs — 收到 PeerInfo 显示列表更新时确认并落盘生效分辨率
+# ---------------------------------------------------------------------------
+IOLOOP = Path("src/client/io_loop.rs")
+t = IOLOOP.read_text(encoding="utf-8")
+
+old_ioloop_pi = '''                Some(message::Union::PeerInfo(pi)) => {
+                    self.handler.set_displays(&pi.displays);
+                    self.handler.set_platform_additions(&pi.platform_additions);
+                }'''
+
+new_ioloop_pi = '''                Some(message::Union::PeerInfo(pi)) => {
+                    self.handler.set_displays(&pi.displays);
+                    self.handler.set_platform_additions(&pi.platform_additions);
+                    self.handler.confirm_resolution_from_displays(&pi.displays);
+                }'''
+
+assert t.count(old_ioloop_pi) == 1, f"{IOLOOP}: expected 1 match for PeerInfo displays handler, got {t.count(old_ioloop_pi)}"
+t = t.replace(old_ioloop_pi, new_ioloop_pi)
+IOLOOP.write_text(t, encoding="utf-8", newline="")
+
+print("resolution patch v4 applied")
